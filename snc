@@ -1,0 +1,244 @@
+#!/usr/bin/env python3
+
+
+import argparse
+import json
+import select
+import socket
+import sys
+import time
+from base64 import b64decode
+from base64 import b64encode
+
+from Crypto.Cipher import AES
+from Crypto.Protocol.KDF import PBKDF2
+from Crypto.Random import get_random_bytes
+
+
+class Message:
+    json_vals = []
+
+    def __init__(self, nonce, salt, ciphertext, digest):
+        self.ciphertext = ciphertext
+        self.digest = digest
+        self.salt = salt
+        self.nonce = nonce
+
+    def encode(self):
+        json_keys = ['nonce', 'salt', 'ciphertext', 'digest']
+        json_vals = [b64encode(self.nonce).decode('utf-8'),
+                     b64encode(self.salt).decode('utf-8'),
+                     b64encode(self.ciphertext).decode('utf-8'),
+                     b64encode(self.digest).decode('utf-8')]
+        return json.dumps(dict(zip(json_keys, json_vals)))
+
+    def decode(encoded_msg):
+        input_msg = json.loads(encoded_msg)
+        json_keys = ['nonce', 'salt', 'ciphertext', 'digest']
+        json_vals = {k: b64decode(input_msg[k]) for k in json_keys}
+        return json_vals
+
+
+def validate_port(input_port):
+    port = int(input_port)
+    if not 0 < port < 65535:
+        sys.stderr.write("Port value should be an integer within range")
+        exit(1)
+    else:
+        return port
+
+
+# Open a connection to server at 'hostname' and 'port'
+def connect_to_server(hostname, port):
+    socket.setdefaulttimeout(60)
+
+    # Open a TCP socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server_address = (hostname, port)
+    try:
+        s.connect(server_address)
+    except socket.error as err:
+        sys.stderr.write("Connection to server %s and port %s failed due to %s" % (hostname, port, err))
+        exit(1)
+    return s
+
+
+# Listen at the given server address
+def listen_for_clients(server_address):
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    timeout = 60
+    while timeout > 0:
+        try:
+            s.bind(server_address)
+            s.listen(1)
+            break
+        except socket.error as _:
+            time.sleep(5)
+            timeout -= 5
+    if timeout <= 0:
+        sys.stderr.write("Binding to %s failed with %d timeout. Server startup failed." % (str(server_address), 60))
+        exit(1)
+    else:
+        return s
+
+
+def get_cipher(password, salt, nonce='none'):
+    # Using Password-Based Key Derivation Function to reduce the chances of brute force
+    key = PBKDF2(password, salt, dkLen=32, count=1000)
+
+    # Nonce is needed only while decryption
+    if nonce == 'none':
+        cipher = AES.new(key, AES.MODE_GCM)
+    else:
+        cipher = AES.new(key, AES.MODE_GCM, nonce)
+    return cipher
+
+
+# Encrypt a plaintext using given key with AES-GCM
+def encrypt_data(key, plaintext):
+    salt = get_random_bytes(16)
+    cipher = get_cipher(key, salt)
+    ciphertext, digest = cipher.encrypt_and_digest(plaintext.encode("utf8"))
+    return Message(cipher.nonce, salt, ciphertext, digest)
+
+
+# Decrypt the data using given key with AES-GCM
+def decrypt_data(data, key):
+    json_values = Message.decode(data)
+
+    cipher = get_cipher(key, json_values['salt'], json_values['nonce'])
+    try:
+        plaintext = cipher.decrypt_and_verify(json_values['ciphertext'], json_values['digest'])
+        return plaintext.decode()
+    except ValueError as e:
+        sys.stderr.write("Packet lacks integrity! %s" % e)
+        exit(1)
+
+
+# Client flow
+def client(key, hostname, port):
+    try:
+        sock = connect_to_server(hostname, port)
+        sockets = [sys.stdin, sock]
+        try:
+            while True:
+                for conn in select.select(sockets, [], [], 0)[0]:
+                    if conn is sys.stdin:
+                        # Encoding logic
+                        line = sys.stdin.readlines()
+                        collect_input = ''
+                        for item in line:
+                            collect_input += item
+                        if collect_input:
+                            msg = encrypt_data(key, collect_input)
+                            msg = msg.encode()
+                            sock.send(len(msg).to_bytes(4, byteorder='big'))
+                            sock.sendall(msg.encode())
+                            sock.shutdown(1)
+                    else:
+                        # Decoding logic
+                        sizeflag = False
+                        size = 1024
+                        if not sizeflag:
+                            size = int.from_bytes(conn.recv(4), byteorder='big')
+                            sizeflag = True
+                        # Data read from socket
+                        data = conn.recv(++size)
+                        data = data.decode("utf8")
+                        if len(data) == 0:
+                            # Exiting client as there is no data
+                            exit(0)
+                        plaintext = decrypt_data(data, key)
+                        sys.stdout.write(plaintext)
+        # Handler for keyboard interrupt
+        except KeyboardInterrupt:
+            sock.close()
+            exit(0)
+    except Exception as e:
+        sys.stdin.write("Exception in client. %s" % e)
+        exit(1)
+
+
+# Server flow
+def server(key, listen):
+    try:
+        sock = listen_for_clients(("localhost", listen))
+        sockets = [sys.stdin, sock]
+        try:
+            while True:
+                for conn in select.select(sockets, [], [], 0)[0]:
+                    try:
+                        if conn is sock:
+                            # Encoding logic
+                            connection, client_address = conn.accept()
+                            sockets.append(connection)
+                        elif conn is sys.stdin:
+                            for s in sockets:
+                                if s not in [sys.stdin, sock]:
+                                    line = conn.readline()
+                                    collect_input = ''
+                                    for item in line:
+                                        collect_input += item
+                                    if collect_input:
+                                        if collect_input != '':
+                                            msg = encrypt_data(key, collect_input)
+                                            msg = msg.encode()
+                                            s.send(len(msg).to_bytes(4, byteorder='big'))
+                                            s.sendall(msg.encode())
+                                        else:
+                                            # No more data to send. Graceful shutdown initiated
+                                            s.shutdown(1)
+                        else:
+                            # Decoding logic
+                            sizeflag = False
+                            size = 1024
+                            if not sizeflag:
+                                size = int.from_bytes(conn.recv(4), byteorder='big')
+                                sizeflag = True
+                            data = conn.recv(++size)
+                            if not data:
+                                # No data received from connection. Exiting immediately
+                                sockets.remove(conn)
+                                exit(0)
+                            else:
+                                data = data.decode("utf8")
+                                plaintext = decrypt_data(data, key)
+                                # Printing to standard output.
+                                # If no file is mentioned, will print to console
+                                sys.stdout.write(plaintext)
+                    except socket.error as err:
+                        sys.stderr.write("Could not accept this connection due to error : %s" % err)
+                        exit(1)
+        # Handler for keyboard interrupt
+        except KeyboardInterrupt:
+            sock.close()
+            exit(0)
+    except Exception as e:
+        sys.stderr.write("Exception in server. %s" % e)
+        exit(1)
+
+
+def main():
+    argparser = argparse.ArgumentParser()
+    argparser.add_argument("-l", "--listen", help="Port number", type=int, required=False)
+    argparser.add_argument("--key", help="Key", type=str, required=True)
+    argparser.add_argument("destination", nargs='?')
+    argparser.add_argument("port", nargs='?')
+    args = argparser.parse_args()
+
+    if args.key and args.listen and not args.destination and not args.port:
+        # Need only the key and listen flag
+        server(args.key, args.listen)
+    elif args.key and args.destination and args.port and not args.listen:
+        # Need server.add.ress, port and the key
+        # Checks if the port number is an integer
+        port = validate_port(args.port)
+        client(args.key, args.destination, port)
+    else:
+        sys.stderr.write("Arguments are not entered as needed.\n Usage : ./snc [-l] [--key KEY] [destination] [port]")
+        exit(1)
+
+
+if __name__ == "__main__":
+    main()
+
